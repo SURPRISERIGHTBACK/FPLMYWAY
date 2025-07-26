@@ -468,98 +468,168 @@ def respond_to_command(
     fixtures_df: pd.DataFrame,
     position_map: Dict[int, str],
     horizon_default: int = 3,
+    *,
+    differential_weight: float = 0.0,
+    preseason_weight: float = 0.0,
+    raw_command: Optional[str] = None,
+    use_expected: bool = False,
 ) -> Tuple[str, Optional[pd.DataFrame]]:
-    """Generate a human readable response to a parsed command.
+    """Generate a response to a parsed command returning a 15‑player squad.
 
-    Based on the parsed parameters, this function delegates to the
-    appropriate helper functions to build a squad, suggest transfers or
-    rate an existing team.  It returns a message string along with an
-    optional data frame for display.
+    This implementation builds a full 15‑man squad for all commands
+    (transfers, wildcard and help) and includes a recommended captain
+    based on highest projected points.  For the "rate" command the
+    function also computes a recommended squad for comparison.
+
+    Parameters
+    ----------
+    params : dict
+        Parsed command parameters.
+    players_df : pd.DataFrame
+        Data frame of FPL players (merged with Understat data if
+        available).
+    teams_df : pd.DataFrame
+        Data frame of FPL teams.
+    fixtures_df : pd.DataFrame
+        Data frame of fixtures (currently unused but retained for
+        extensibility).
+    position_map : dict
+        Mapping of position ids to names.
+    horizon_default : int, optional
+        Default projection horizon in gameweeks if none is specified in
+        the command.
+    differential_weight : float, optional
+        Weight applied to low ownership players when computing squad
+        scores.  A higher value prioritises differentials.
+    preseason_weight : float, optional
+        Weight applied to Understat pre‑season xG values (if present).
+
+    Returns
+    -------
+    tuple
+        A message string and a data frame representing the selected 15
+        players.  The message includes a captain recommendation.
     """
-    # Determine horizon
     horizon = params.get("horizon", horizon_default)
     cmd_type = params.get("type", "help")
-    if cmd_type == "transfers":
-        # Suggest top players to transfer in
-        df = compute_predicted_points(players_df, horizon)
-        # Exclude players flagged as injured or unavailable
-        df = df[df["chance_of_playing_next_round"].fillna(100) > 25]
-        # Sort by predicted points
-        df = df.sort_values(by="predicted_points", ascending=False)
-        suggestions = df.head(10)[[
-            "web_name",
-            "position",
-            "team",
-            "now_cost",
-            "predicted_points",
-        ]]
-        # Map team ids to team names
-        suggestions["team"] = suggestions["team"].apply(
+
+    # Prepare player pool with predicted points and scores.  Use the
+    # ``use_expected`` flag to choose between historic points per game or
+    # expected goals/assists.
+    full_df = compute_predicted_points(players_df, horizon, use_expected)
+    # Filter out players with very low chance of playing next round
+    full_df = full_df[full_df["chance_of_playing_next_round"].fillna(100) > 25]
+    # Compute value and base score
+    full_df = full_df.copy()
+    full_df["value"] = full_df["now_cost"] / 10.0
+    full_df["score"] = full_df["predicted_points"] / full_df["value"]
+    # Apply differential and preseason weights
+    if differential_weight > 0:
+        full_df["score"] += differential_weight * (100 - full_df["selected_by_percent"])
+    if preseason_weight > 0 and "u_xG" in full_df.columns:
+        full_df["score"] += preseason_weight * full_df["u_xG"].fillna(0)
+
+    def map_team_names(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["team"] = out["team"].apply(
             lambda tid: teams_df.loc[teams_df["id"] == tid, "name"].values[0]
         )
-        msg = f"Top transfer targets for the next {horizon} gameweeks:"
-        return msg, suggestions
+        return out
+
+    if cmd_type == "transfers":
+        # Build a full 15‑man squad optimised for the specified horizon
+        squad = build_squad(
+            full_df,
+            budget=100.0,
+            horizon=horizon,
+            max_players_per_team=3,
+            differential_weight=differential_weight,
+            preseason_weight=preseason_weight,
+        )
+        squad_display = map_team_names(
+            squad[["web_name", "position", "team", "value", "predicted_points"]]
+        )
+        # Determine captain as player with highest predicted points
+        captain_row = squad.loc[squad["predicted_points"].idxmax()]
+        captain_name = captain_row["web_name"]
+        msg = (
+            f"Best 15‑player squad for the next {horizon} gameweeks. "
+            f"Recommended captain: {captain_name}."
+        )
+        return msg, squad_display
     elif cmd_type == "wildcard":
-        # Build a wildcard draft
+        # Determine specific team constraint if provided
         team_limit = params.get("team_limit", 3)
         specific_team_name = params.get("team_name")
-        df = compute_predicted_points(players_df, horizon)
-        # If the user specified a particular team limit for one club, override
         if specific_team_name:
-            # Map team name to id
+            # Map team name to id (case insensitive)
             matching = teams_df[teams_df["name"].str.contains(specific_team_name, case=False)]
             if not matching.empty:
                 team_id = matching.iloc[0]["id"]
-                # Create a copy of player pool where team limit is applied only
-                # to the specified team; others remain at default 3.
-                squad = build_squad(
-                    df,
+                # Build initial squad with default constraints
+                initial_squad = build_squad(
+                    full_df,
                     budget=100.0,
                     horizon=horizon,
                     max_players_per_team=3,
-                )
-                # Filter squad to ensure constraint on specific team
-                counts = squad["team"].value_counts().to_dict()
+                    differential_weight=differential_weight,
+                    preseason_weight=preseason_weight,
+                ).copy()
+                # Ensure specific team limit is respected
+                counts = initial_squad["team"].value_counts().to_dict()
                 while counts.get(team_id, 0) > team_limit:
-                    # Remove the lowest scoring player from that team
+                    # Remove the lowest scoring player from the specified team
                     idx_to_drop = (
-                        squad[squad["team"] == team_id]["score"].idxmin()
+                        initial_squad[initial_squad["team"] == team_id]["score"].idxmin()
                     )
-                    squad = squad.drop(idx_to_drop)
-                    counts = squad["team"].value_counts().to_dict()
-                # Refill squad with best available players until 15 players
-                needed = 15 - len(squad)
+                    initial_squad = initial_squad.drop(idx_to_drop)
+                    counts = initial_squad["team"].value_counts().to_dict()
+                # Fill up to 15 players from the remaining pool
+                needed = 15 - len(initial_squad)
                 if needed > 0:
-                    excluded_ids = set(squad["id"])
-                    candidate_pool = df[~df["id"].isin(excluded_ids)]
-                    top_candidates = candidate_pool.sort_values(by="score", ascending=False)
-                    for _, row in top_candidates.iterrows():
-                        if len(squad) >= 15:
+                    excluded_ids = set(initial_squad["id"])
+                    # Sort remaining players by score
+                    remaining = full_df[~full_df["id"].isin(excluded_ids)].sort_values(by="score", ascending=False)
+                    for _, row in remaining.iterrows():
+                        if len(initial_squad) >= 15:
                             break
+                        # Respect general max 3 per team
                         if counts.get(row["team"], 0) >= 3:
                             continue
-                        # Add row
-                        squad = pd.concat([squad, row.to_frame().T], ignore_index=True)
+                        initial_squad = pd.concat([initial_squad, row.to_frame().T], ignore_index=True)
                         counts[row["team"]] = counts.get(row["team"], 0) + 1
-                # Map team ids to names
-                squad_display = squad[["web_name", "position", "team", "value", "predicted_points"]].copy()
-                squad_display["team"] = squad_display["team"].apply(
-                    lambda tid: teams_df.loc[teams_df["id"] == tid, "name"].values[0]
+                squad_display = map_team_names(
+                    initial_squad[["web_name", "position", "team", "value", "predicted_points"]]
                 )
-                msg = f"Wildcard draft (max {team_limit} from {specific_team_name})"
+                captain_row = initial_squad.loc[initial_squad["predicted_points"].idxmax()]
+                captain_name = captain_row["web_name"]
+                msg = (
+                    f"Wildcard draft with at most {team_limit} players from {specific_team_name}. "
+                    f"Recommended captain: {captain_name}."
+                )
                 return msg, squad_display
-        # Default wildcard without specific team limit
-        squad = build_squad(df, budget=100.0, horizon=horizon)
-        squad_display = squad[["web_name", "position", "team", "value", "predicted_points"]].copy()
-        squad_display["team"] = squad_display["team"].apply(
-            lambda tid: teams_df.loc[teams_df["id"] == tid, "name"].values[0]
+        # Standard wildcard: just build a squad
+        squad = build_squad(
+            full_df,
+            budget=100.0,
+            horizon=horizon,
+            max_players_per_team=3,
+            differential_weight=differential_weight,
+            preseason_weight=preseason_weight,
         )
-        msg = f"Wildcard draft for the next {horizon} gameweeks:"
+        squad_display = map_team_names(
+            squad[["web_name", "position", "team", "value", "predicted_points"]]
+        )
+        captain_row = squad.loc[squad["predicted_points"].idxmax()]
+        captain_name = captain_row["web_name"]
+        msg = (
+            f"Wildcard draft for the next {horizon} gameweeks. "
+            f"Recommended captain: {captain_name}."
+        )
         return msg, squad_display
     elif cmd_type == "rate":
-        # Rate a team provided by the user.  Expect comma separated names after the command.
-        # Extract names after colon or the word "team"
-        m = re.search(r":\s*(.*)", command)
+        # Parse names from command string (pass raw_command down from caller)
+        m = re.search(r":\s*(.*)", raw_command or "")
         names_str = m.group(1) if m else ""
         names = [n.strip().lower() for n in names_str.split(",") if n.strip()]
         if not names:
@@ -567,29 +637,64 @@ def respond_to_command(
                 "To rate your team, list the players after a colon, e.g. 'rate my team: Salah, Saka, Haaland'.",
                 None,
             )
-        df = compute_predicted_points(players_df, horizon)
-        # Match players by web_name ignoring case
-        rating_df = df[df["web_name"].str.lower().isin(names)].copy()
+        # Compute predicted points for the player's team
+        rating_df = full_df[full_df["web_name"].str.lower().isin(names)].copy()
         missing = [n for n in names if n not in rating_df["web_name"].str.lower().tolist()]
-        if missing:
-            msg = f"The following players were not recognised: {', '.join(missing)}"
-        else:
-            msg = f"Projected points for your team over the next {horizon} gameweeks."
-        rating_display = rating_df[["web_name", "position", "team", "now_cost", "predicted_points"]].copy()
-        rating_display["team"] = rating_display["team"].apply(
-            lambda tid: teams_df.loc[teams_df["id"] == tid, "name"].values[0]
+        # Build recommended squad for comparison
+        squad = build_squad(
+            full_df,
+            budget=100.0,
+            horizon=horizon,
+            max_players_per_team=3,
+            differential_weight=differential_weight,
+            preseason_weight=preseason_weight,
         )
-        return msg, rating_display
+        captain_row = squad.loc[squad["predicted_points"].idxmax()]
+        captain_name = captain_row["web_name"]
+        # Compose message summarising predicted points
+        if rating_df.empty:
+            msg = (
+                f"None of the specified players were recognised. "
+                f"Here is a recommended squad for the next {horizon} gameweeks. "
+                f"Recommended captain: {captain_name}."
+            )
+        else:
+            total_points = rating_df["predicted_points"].sum()
+            msg = (
+                f"Your specified team has a projected total of {total_points:.1f} points over the next {horizon} gameweeks. "
+                f"Here is a recommended 15‑player squad for comparison. "
+                f"Recommended captain: {captain_name}."
+            )
+            if missing:
+                msg += "\nThe following players were not recognised: " + ", ".join(missing)
+        squad_display = map_team_names(
+            squad[["web_name", "position", "team", "value", "predicted_points"]]
+        )
+        return msg, squad_display
     else:
-        # Help / default message
+        # Help or unrecognised command: show default squad and instructions
+        squad = build_squad(
+            full_df,
+            budget=100.0,
+            horizon=horizon,
+            max_players_per_team=3,
+            differential_weight=differential_weight,
+            preseason_weight=preseason_weight,
+        )
+        squad_display = map_team_names(
+            squad[["web_name", "position", "team", "value", "predicted_points"]]
+        )
+        captain_row = squad.loc[squad["predicted_points"].idxmax()]
+        captain_name = captain_row["web_name"]
         help_text = (
             "Enter a command such as:\n\n"
-            "- 'Suggest best transfers for next 3 GWs' to see the top performers.\n"
-            "- 'Wildcard draft with only 2 players from Liverpool' to build a draft squad.\n"
-            "- 'Rate my team: Salah, Saka, Haaland' to get a projection for your team.\n\n"
-            "You can also mention differentials in your command to prioritise low ownership players."
+            "- 'Suggest best transfers for next 3 GWs' to see a 15‑player squad.\n"
+            "- 'Wildcard draft with only 2 players from Liverpool' to build a squad respecting club limits.\n"
+            "- 'Rate my team: Salah, Saka, Haaland' to compare your squad to a recommended one.\n\n"
+            "You can also adjust the sliders in the sidebar to favour differentials or pre‑season form. "
+            f"Recommended captain for the current selection: {captain_name}."
         )
-        return help_text, None
+        return help_text, squad_display
 
 
 ###############################################################################
@@ -689,20 +794,20 @@ def main() -> None:
         params.setdefault("horizon", horizon)
         params.setdefault("differential_weight", differential_weight)
         params.setdefault("preseason_weight", preseason_weight)
-        # Update predicted points based on selected model
-        player_pool = compute_predicted_points(players_df, params["horizon"], use_expected)
-        # Save score to use in wildcard building
-        player_pool = player_pool.copy()
-        player_pool["value"] = player_pool["now_cost"] / 10.0
-        player_pool["score"] = player_pool["predicted_points"] / player_pool["value"]
-        # Respond
+        params.setdefault("use_expected", use_expected)
+        # Respond: build a full squad based on the raw player data.  Pass the
+        # sliders explicitly so the weights are respected.
         msg, data = respond_to_command(
             params,
-            player_pool,
+            players_df,
             teams_df,
             fixtures_df,
             position_map,
             horizon_default=horizon,
+            differential_weight=params.get("differential_weight", 0.0),
+            preseason_weight=params.get("preseason_weight", 0.0),
+            raw_command=command,
+            use_expected=params.get("use_expected", False),
         )
         st.subheader("Response")
         st.write(msg)
