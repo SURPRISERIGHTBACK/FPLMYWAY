@@ -60,6 +60,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 
 try:
     import streamlit as st  # type: ignore
@@ -75,15 +76,36 @@ except ImportError:
 ###############################################################################
 
 @st.cache_data if st else (lambda func: func)
-def load_fpl_data(bootstrap_path: Path, fixtures_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[int, str]]:
-    """Load the FPL bootstrap and fixtures JSON files.
+def load_fpl_data(
+    bootstrap_path: Optional[Path] = None,
+    fixtures_path: Optional[Path] = None,
+    *,
+    use_remote: bool = True,
+    user_agent: str = "Mozilla/5.0"
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[int, str]]:
+    """Load FPL player, team and fixture data.
+
+    This function attempts to read the bootstrap (player/team) and
+    fixture information from local files.  If the files are not
+    provided or do not exist and ``use_remote`` is True, it will fall
+    back to downloading the JSON from the official FPL endpoints.  A
+    custom user agent can be supplied if the default causes access to
+    be blocked.
 
     Parameters
     ----------
-    bootstrap_path : Path
-        Path to the ``download.json`` file containing the bootstrap data.
-    fixtures_path : Path
-        Path to the ``download (1).json`` file containing fixture data.
+    bootstrap_path : Path or None, optional
+        Path to a local JSON file containing bootstrap data.  If None or
+        the file does not exist, the remote API will be used.
+    fixtures_path : Path or None, optional
+        Path to a local JSON file containing fixture data.  If None or
+        the file does not exist, the remote API will be used.
+    use_remote : bool, optional
+        Whether to allow downloading data from the remote FPL API when
+        local files are unavailable.  Defaults to True.
+    user_agent : str, optional
+        HTTP User‑Agent header sent when downloading data from the
+        remote API.  Some servers block default Python user agents.
 
     Returns
     -------
@@ -96,8 +118,26 @@ def load_fpl_data(bootstrap_path: Path, fixtures_path: Path) -> Tuple[pd.DataFra
     position_map : dict
         Mapping from element_type id to human readable position names.
     """
-    with open(bootstrap_path) as f:
-        bootstrap = json.load(f)
+    # Helper to load JSON either from file or remote
+    def _load_json(path: Optional[Path], url: str) -> dict:
+        if path is not None and path.exists():
+            with open(path) as f:
+                return json.load(f)
+        if not use_remote:
+            raise FileNotFoundError(f"File {path} not found and remote loading disabled")
+        headers = {"User-Agent": user_agent}
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    bootstrap = _load_json(
+        bootstrap_path,
+        "https://fantasy.premierleague.com/api/bootstrap-static/",
+    )
+    fixtures_raw = _load_json(
+        fixtures_path,
+        "https://fantasy.premierleague.com/api/fixtures/",
+    )
 
     players = pd.DataFrame(bootstrap["elements"])
     teams = pd.DataFrame(bootstrap["teams"])
@@ -138,25 +178,52 @@ def load_fpl_data(bootstrap_path: Path, fixtures_path: Path) -> Tuple[pd.DataFra
     }
     players_df["position"] = players_df["element_type"].map(position_map)
 
-    # Load fixtures
-    with open(fixtures_path) as f:
-        fixtures_raw = json.load(f)
     fixtures_df = pd.DataFrame(fixtures_raw)
 
     return players_df, teams, fixtures_df, position_map
 
 
 @st.cache_data if st else (lambda func: func)
-def load_understat_data(understat_path: Path) -> pd.DataFrame:
-    """Load Understat player level data from a CSV file.
+def load_understat_data(
+    understat_path: Optional[Path] = None,
+    *,
+    use_remote: bool = True,
+    remote_url: str = "https://raw.githubusercontent.com/douglasbc/scraping-understat-dataset/main/datasets/epl/players_epl_21-22.csv",
+    user_agent: str = "Mozilla/5.0",
+) -> pd.DataFrame:
+    """Load Understat player level data from a CSV file or remote URL.
 
-    The Understat data used here is a static snapshot of the 2021–22
-    Premier League season.  Columns include expected goals (xG), assists
-    (xA), shots, key passes and other summary statistics.  When
-    combining with FPL data the app performs a simple case‑insensitive
-    match on the player name.
+    Parameters
+    ----------
+    understat_path : Path or None, optional
+        Path to a local CSV file.  If None or the file does not exist and
+        ``use_remote`` is True, the CSV will be downloaded from the
+        provided remote URL.
+    use_remote : bool, optional
+        Allow downloading the CSV when a local file is unavailable.
+    remote_url : str, optional
+        The URL to download the Understat CSV from.  Defaults to a
+        publicly hosted snapshot of the 2021–22 Premier League season.
+    user_agent : str, optional
+        HTTP User‑Agent header to send when downloading remote data.
+
+    Returns
+    -------
+    pd.DataFrame
+        Data frame containing Understat player information.  A
+        normalised player name column ``player_name_norm`` is added for
+        easier matching.
     """
-    df = pd.read_csv(understat_path)
+    if understat_path is not None and understat_path.exists():
+        df = pd.read_csv(understat_path)
+    else:
+        if not use_remote:
+            raise FileNotFoundError(f"Understat file {understat_path} not found and remote loading disabled")
+        headers = {"User-Agent": user_agent}
+        resp = requests.get(remote_url, headers=headers)
+        resp.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text))
     # Normalise names by stripping and lowercasing
     df["player_name_norm"] = df["player_name"].str.replace(" ", "").str.lower()
     return df
@@ -545,16 +612,58 @@ def main() -> None:
         "It does **not** guarantee optimal decisions but can help you explore options."
     )
 
-    # File paths relative to the script
-    bootstrap_path = Path(__file__).parent / "download.json"
-    fixtures_path = Path(__file__).parent / "download (1).json"
-    understat_path = Path(__file__).parent / "players_epl_21-22.csv"
-
-    # Load data
-    players_df, teams_df, fixtures_df, position_map = load_fpl_data(
-        bootstrap_path, fixtures_path
+    # Sidebar controls for uploading local data
+    st.sidebar.header("Data sources")
+    st.sidebar.write(
+        "By default the app downloads the latest FPL and Understat data from "
+        "the internet.  You can optionally upload your own data files here."
     )
-    understat_df = load_understat_data(understat_path)
+    uploaded_bootstrap = st.sidebar.file_uploader(
+        "Upload FPL bootstrap JSON (optional)", type=["json"]
+    )
+    uploaded_fixtures = st.sidebar.file_uploader(
+        "Upload FPL fixtures JSON (optional)", type=["json"]
+    )
+    uploaded_understat = st.sidebar.file_uploader(
+        "Upload Understat CSV (optional)", type=["csv"]
+    )
+
+    # Determine local file paths if uploads are not used
+    bootstrap_path = None
+    fixtures_path = None
+    understat_path = None
+    # Save uploaded files to a temporary location if provided
+    if uploaded_bootstrap is not None:
+        bootstrap_path = Path("/tmp/bootstrap.json")
+        with open(bootstrap_path, "wb") as out:
+            out.write(uploaded_bootstrap.getvalue())
+    else:
+        # Check for existing local file in script directory
+        candidate = Path(__file__).parent / "download.json"
+        if candidate.exists():
+            bootstrap_path = candidate
+    if uploaded_fixtures is not None:
+        fixtures_path = Path("/tmp/fixtures.json")
+        with open(fixtures_path, "wb") as out:
+            out.write(uploaded_fixtures.getvalue())
+    else:
+        candidate = Path(__file__).parent / "download (1).json"
+        if candidate.exists():
+            fixtures_path = candidate
+    if uploaded_understat is not None:
+        understat_path = Path("/tmp/understat.csv")
+        with open(understat_path, "wb") as out:
+            out.write(uploaded_understat.getvalue())
+    else:
+        candidate = Path(__file__).parent / "players_epl_21-22.csv"
+        if candidate.exists():
+            understat_path = candidate
+
+    # Load data (remote fallback enabled)
+    players_df, teams_df, fixtures_df, position_map = load_fpl_data(
+        bootstrap_path=bootstrap_path, fixtures_path=fixtures_path, use_remote=True
+    )
+    understat_df = load_understat_data(understat_path=understat_path, use_remote=True)
     players_df = merge_understat(players_df, understat_df)
 
     # Sidebar controls
